@@ -116,7 +116,3 @@ run_id=$(printf '%s\n' "$pending" | awk 'NR == 1 {print $2}')
 ## 未做
 
 本仓库提供本地命令行工具，在线演示页单独维护。网络调用和多轮对话记忆均未接入。可疑文字识别只覆盖演示规则，审批人标识由本地命令提供，未接入身份认证。
-
-## English overview
-
-The command-line demo uses the Python standard library. A rule-based planner proposes actions. The runner checks tool access and account ownership, flags suspicious tool results, and enforces per-account limits. SQLite stores the simulated effects and idempotency keys. Audit events are saved in JSON Lines, and the demo command exports deterministic JSON.
