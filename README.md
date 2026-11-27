@@ -1,6 +1,37 @@
 # support-actions
 
-青柚家电客服工具的本地演示。客服 Agent 要能查询订单、改地址和发起退款。这个项目演示工具白名单、参数和账户权限校验、退款审批，以及执行超时或重复批准时怎样防止重复退款。M2 加入可疑订单备注标记、账户限额和大额退款双人审批。审计记录可以按运行号回放。
+青柚家电的客服团队想让助手代办查单、改址和退款，同时避免查到别人的订单、改错地址或重复退款。
+
+- 查询当前账户的订单，给未发货的订单改地址。
+- 退款须人工批准，大额退款需用两个不同的审批人标识分别批准，操作和退款都有账户限额。
+- 按运行号回放已处理步骤的状态和结果，记录中会遮住门牌号。
+
+## 怎么验证的
+
+实跑 `/opt/homebrew/bin/python3 -m unittest`，**38 项全部通过**。测试确认越权操作和引用可疑备注的步骤会被拒绝，未经批准的退款不会入账，同一退款步骤在重复批准、超时或重启后也不会重复入账，回放不会再次调用业务系统。
+
+在临时副本里逐项破坏订单权限、退款审批、防重复退款、可疑备注标记、账户限额和大额双人审批，对应测试均按预期失败。恢复代码后，全套测试再次通过。
+
+## 试一下
+
+[打开在线演示](https://xoqiu.cn/actions-demo/index.html)
+
+从刚克隆的仓库根目录运行。第一条跑测试，第二条提交一笔待审的模拟退款。
+
+```sh
+python3 -m unittest
+python3 -m supportactions ask --account A "A-102 退款 39 元"
+```
+
+演示数据均为虚构，无真实模型或用户。Owner 定需求和验收标准，指导 AI 编程工具实现。
+
+## English summary
+
+- A support team needs to handle order requests without exposing another customer’s orders or issuing duplicate refunds.
+- The demo looks up orders, updates shipping addresses before dispatch, and puts refunds in an approval queue.
+- Large refunds require approval under two distinct approver IDs. The audit trail can be replayed without calling the simulated backend.
+- All 38 tests passed. Deliberately breaking key rules made the corresponding tests fail.
+- The demo uses fictional data, has no live model or users, and was built with AI coding tools under the owner’s requirements and acceptance criteria.
 
 ## 运行
 
@@ -84,8 +115,4 @@ run_id=$(printf '%s\n' "$pending" | awk 'NR == 1 {print $2}')
 
 ## 未做
 
-真实模型、网络调用、网页和多轮对话记忆均未接入。可疑文字识别只覆盖演示规则，审批人标识由本地命令提供，未接入身份认证。订单和退款均为虚构数据。
-
-## English overview
-
-A standard-library Python demo of customer-support tool calls. A rule-based planner proposes actions. The runner checks tool access and account ownership, flags suspicious tool results, enforces per-account limits, and requires two approvers for large refunds. SQLite stores the simulated effects and idempotency keys. JSON Lines support audit replay without business calls, and the demo command exports deterministic JSON.
+本仓库提供本地命令行工具，在线演示页单独维护。网络调用和多轮对话记忆均未接入。可疑文字识别只覆盖演示规则，审批人标识由本地命令提供，未接入身份认证。
