@@ -1,0 +1,397 @@
+import json
+import os
+import subprocess
+import sys
+import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import ANY, DEFAULT, Mock, call, patch
+
+from supportactions import trace
+from supportactions import __main__ as cli_module
+from supportactions.approvals import APPROVED, EXPIRED, PENDING, REJECTED
+from supportactions.backend import Backend
+from supportactions.planner import Call, plan
+from supportactions.runner import Runner
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REFUND = "我的订单 A-102 退款 199 元"
+
+
+class SupportActionsTests(unittest.TestCase):
+    def setUp(self):
+        scratch = self.enter_tempdir()
+        self.directory = scratch / ".support-actions"
+        self.now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def enter_tempdir(self):
+        scratch = TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        return Path(scratch.name)
+
+    def runner(self, **kwargs):
+        return Runner(self.directory, clock=lambda: self.now, **kwargs)
+
+    def cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "supportactions", *args], cwd=self.directory.parent,
+            env={**os.environ, "PYTHONPATH": str(ROOT)}, capture_output=True, check=True,
+            text=True, encoding="utf-8",
+        ).stdout
+
+    def test_allow_list_blocks_entire_run(self):
+        with self.runner() as runner:
+            statements = []
+            runner.db.set_trace_callback(statements.append)
+            run = runner.submit("A", plan("坏计划", "A"))
+            self.assertEqual([step["status"] for step in run["steps"]], [trace.UNEXECUTED, REJECTED])
+            self.assertEqual(run["steps"][1]["error"], "工具不在白名单")
+            self.assertFalse(any("FROM orders" in sql for sql in statements))
+
+    def test_foreign_order_blocks_dependent_step(self):
+        calls = [
+            Call("lookup_order", {"order_id": "B-201"}),
+            Call("change_address", {"order_id": "A-101", "new_address": "青柚路9287号"}, (1,)),
+            Call("list_orders", {"account": "A"}),
+            Call("list_orders", {"account": "B"}),
+        ]
+        with self.runner() as runner:
+            run = runner.submit("A", calls)
+            self.assertEqual(
+                [step["status"] for step in run["steps"]],
+                [REJECTED, trace.UNEXECUTED, trace.SUCCESS, REJECTED],
+            )
+            self.assertEqual(run["steps"][0]["error"], "无权操作该订单")
+            self.assertEqual(run["steps"][1]["error"], "依赖步骤未成功")
+            self.assertEqual(runner.backend.order("A-101")["address"], "青柚南路***")
+            orders = run["steps"][2]["result"]["orders"]
+            self.assertEqual([row["order_id"] for row in orders], ["A-101", "A-102", "A-103"])
+
+    def test_invalid_arguments_block_only_that_step_and_its_dependents(self):
+        calls = [
+            Call("lookup_order", {}),
+            Call("lookup_order", {"order_id": 102}),
+            Call("refund", {"order_id": "A-102", "amount": True}),
+            Call("list_orders", {"account": "A"}, (2,)),
+            Call("lookup_order", {"order_id": "A-102"}),
+            *plan("A-102 退款 199.0000000000000001 元", "A"),
+        ]
+        with self.runner() as runner:
+            run = runner.submit("A", calls)
+            self.assertEqual(
+                [step["status"] for step in run["steps"]],
+                [REJECTED, REJECTED, REJECTED, trace.UNEXECUTED, trace.SUCCESS, REJECTED],
+            )
+            self.assertEqual(runner.queue(), [])
+
+    def test_overpayment_and_shipped_order_are_rejected(self):
+        calls = [
+            Call("refund", {"order_id": "A-102", "amount": 199.01}),
+            Call("change_address", {"order_id": "A-103", "new_address": "青柚路9287号"}),
+        ]
+        with self.runner() as runner:
+            run = runner.submit("A", calls)
+            self.assertEqual([step["status"] for step in run["steps"]], [REJECTED, REJECTED])
+            self.assertEqual([step["error"] for step in run["steps"]], ["退款金额超过实付", "订单已发货"])
+            self.assertEqual(runner.queue(), [])
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+            self.assertEqual(runner.backend.order("A-103")["address"], "青柚东路***")
+
+    def test_refund_waits_for_approval_and_runs_once_after_restart(self):
+        pending = self.cli("ask", "--account", "A", REFUND)
+        self.assertIn("1 refund 待审", pending)
+        run_id = pending.splitlines()[0].split()[1]
+        with self.runner() as runner:
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+        self.assertIn(f"{run_id} 1 待审", self.cli("approvals"))
+        approved = self.cli("approve", run_id, "1")
+        self.assertIn("1 refund 成功", approved)
+        self.assertEqual(self.cli("approve", run_id, "1"), approved)
+        with self.runner() as runner:
+            self.assertEqual(runner.run(run_id)["status"], trace.SUCCESS)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_approved_refunds_cannot_exceed_remaining_amount(self):
+        with self.runner() as runner:
+            first = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            second = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            self.assertEqual([row["status"] for row in runner.queue()], [PENDING, PENDING])
+            self.assertEqual(runner.decide(first, 1, APPROVED)["status"], trace.SUCCESS)
+        with self.runner() as restarted:
+            blocked = restarted.decide(second, 1, APPROVED)
+            self.assertEqual(blocked["status"], trace.FAILED)
+            self.assertEqual(blocked["steps"][0]["error"], "退款金额超过剩余可退金额")
+            rows = restarted.db.execute("SELECT order_id, SUM(amount_cents), COUNT(*) FROM refunds GROUP BY order_id")
+            self.assertEqual([tuple(row) for row in rows], [("A-102", 19900, 1)])
+
+    def test_refund_steps_keep_distinct_keys_and_exact_amounts_after_restart(self):
+        calls = [
+            Call("refund", {"order_id": "A-102", "amount": 77.13}),
+            Call("refund", {"order_id": "A-102", "amount": 121.87}, (1,)),
+        ]
+        with self.runner() as runner:
+            run_id = runner.submit("A", calls)["run_id"]
+            first = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual([step["status"] for step in first["steps"]], [trace.SUCCESS, PENDING])
+            complete = runner.decide(run_id, 2, APPROVED)
+            self.assertEqual([step["status"] for step in complete["steps"]], [trace.SUCCESS, trace.SUCCESS])
+        with self.runner() as restarted:
+            self.assertEqual(restarted.run(run_id), complete)
+            for step in (1, 2):
+                self.assertEqual(restarted.decide(run_id, step, APPROVED), complete)
+            rows = restarted.db.execute("SELECT order_id, amount_cents FROM refunds ORDER BY amount_cents")
+            self.assertEqual([tuple(row) for row in rows], [("A-102", 7713), ("A-102", 12187)])
+            keys = restarted.db.execute("SELECT effect_key FROM effects ORDER BY effect_key")
+            self.assertEqual([row[0] for row in keys], [f"{run_id}:1", f"{run_id}:2"])
+
+    def test_backend_retries_same_effect_key_once_even_after_restart(self):
+        with self.runner() as runner:
+            pending = runner.submit("A", plan("A-102 退款 50 元", "A"))
+            run_id = pending["run_id"]
+            result = runner.decide(run_id, 1, APPROVED)["steps"][0]["result"]
+            with runner.db:
+                runner.db.execute("BEGIN IMMEDIATE")
+                retry = runner.backend.execute(
+                    f"{run_id}:1", runner.backend.refund, order_id="A-102", amount_cents=5000,
+                )
+            self.assertEqual(retry, result)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+        with self.runner() as restarted:
+            with restarted.db:
+                restarted.db.execute("BEGIN IMMEDIATE")
+                retry = restarted.backend.execute(
+                    f"{run_id}:1", restarted.backend.refund, order_id="A-102", amount_cents=5000,
+                )
+            self.assertEqual(retry, result)
+            self.assertEqual(restarted.backend.refund_count("A-102"), 1)
+
+    def test_expired_or_rejected_approval_never_executes(self):
+        with self.runner() as runner:
+            rejected = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            expired = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            expired_on_queue = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            self.assertEqual(runner.decide(rejected, 1, REJECTED)["status"], REJECTED)
+            self.assertEqual(runner.decide(rejected, 1, APPROVED)["status"], REJECTED)
+            self.now += timedelta(minutes=5)
+            self.assertEqual(runner.decide(expired, 1, APPROVED)["status"], EXPIRED)
+            self.assertEqual({row["status"] for row in runner.queue()}, {EXPIRED, REJECTED})
+            self.assertEqual(trace.replay(self.directory, expired_on_queue)["status"], EXPIRED)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+
+    def test_rejected_approval_stops_remaining_independent_steps(self):
+        calls = [
+            *plan(REFUND, "A"),
+            *plan("A-101 改地址 青柚街9287号", "A"),
+            *plan("A-101 退款 39 元", "A"),
+        ]
+        with self.runner() as runner:
+            original_address = runner.backend.order("A-101")["address"]
+            run_id = runner.submit("A", calls)["run_id"]
+            rejected = runner.decide(run_id, 1, REJECTED)
+            self.assertEqual(rejected["status"], REJECTED)
+            self.assertEqual([step["status"] for step in rejected["steps"]],
+                             [REJECTED, trace.UNEXECUTED, trace.UNEXECUTED])
+            self.assertEqual(runner.backend.order("A-101")["address"], original_address)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+            self.assertEqual([(row["step"], row["status"]) for row in runner.queue()], [(1, REJECTED)])
+        with self.runner() as restarted:
+            self.assertEqual(restarted.run(run_id), rejected)
+
+    def test_timeout_after_effect_is_confirmed_by_key_without_retry(self):
+        with self.runner(faults={"test-timeout:1": "timeout_after_success"}) as runner:
+            pending = runner.submit("A", plan(REFUND, "A"), run_id="test-timeout")
+            with patch.object(runner.backend, "execute", wraps=runner.backend.execute) as execute:
+                run = runner.decide(pending["run_id"], 1, APPROVED)
+            self.assertEqual(execute.call_count, 1)
+            self.assertEqual([event["status"] for event in run["events"]], [PENDING, "待执行", "结果不明", trace.SUCCESS])
+            self.assertEqual(run["steps"][0]["source"], "幂等查询")
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_second_timeout_is_confirmed_before_another_retry(self):
+        key = "test-second-timeout:1"
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan(REFUND, "A"), run_id="test-second-timeout")["run_id"]
+            # Keep the fake backend's internal key lookup separate from the runner's recovery queries.
+            backend = Backend(runner.db, {key: "timeout_after_success"})
+            with (
+                patch.object(runner.backend, "execute") as execute,
+                patch.object(runner.backend, "result", wraps=runner.backend.result) as result,
+            ):
+                def attempt(key, handler, **params):
+                    if execute.call_count == 1:
+                        raise TimeoutError
+                    return backend.execute(key, handler, **params)
+
+                execute.side_effect = attempt
+                operations = Mock()
+                operations.attach_mock(execute, "execute")
+                operations.attach_mock(result, "result")
+                completed = runner.decide(run_id, 1, APPROVED)
+            refund = call.execute(key, ANY, amount=199.0, order_id="A-102")
+            self.assertEqual(operations.mock_calls, [refund, call.result(key), refund, call.result(key)])
+            self.assertEqual(completed["status"], trace.SUCCESS)
+            self.assertEqual(completed["steps"][0]["attempt"], 2)
+            self.assertEqual(completed["steps"][0]["source"], "幂等查询")
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_unknown_timeout_tries_twice_more_then_stops(self):
+        with self.runner(faults={"test-unknown:1": "unknown"}) as runner:
+            pending = runner.submit("A", plan(REFUND, "A"), run_id="test-unknown")
+            with patch.object(runner.backend, "execute", wraps=runner.backend.execute) as execute:
+                run = runner.decide(pending["run_id"], 1, APPROVED)
+                self.assertEqual(runner.decide(pending["run_id"], 1, APPROVED), run)
+                self.assertEqual(execute.call_count, 3)
+                self.assertEqual({call.args[0] for call in execute.call_args_list}, {"test-unknown:1"})
+            self.assertEqual(run["status"], trace.REVIEW)
+            self.assertEqual(
+                [event["status"] for event in run["events"]],
+                [PENDING, "待执行", "结果不明", "查询无记录", "重试中", "结果不明", "查询无记录",
+                 "重试中", "结果不明", "查询无记录", trace.REVIEW],
+            )
+        with self.runner() as restarted:
+            self.assertEqual(restarted.run(pending["run_id"]), run)
+            self.assertEqual(restarted.backend.refund_count("A-102"), 0)
+
+    def test_definite_backend_failure_does_not_retry(self):
+        with self.runner(faults={"test-failure:1": "failure"}) as runner:
+            calls = plan("A-101 改地址 青柚路9287号", "A")
+            run = runner.submit("A", calls, run_id="test-failure")
+            self.assertEqual([event["status"] for event in run["events"]], ["待执行", trace.FAILED])
+            self.assertEqual(runner.backend.order("A-101")["address"], "青柚南路***")
+
+    def test_replay_matches_original_without_backend_access(self):
+        with self.runner() as runner, patch.object(trace, "record", wraps=trace.record) as record:
+            runner.submit("A", plan(REFUND, "A"), run_id="test-replay")
+            self.now += timedelta(seconds=30)
+            runner.decide("test-replay", 1, APPROVED)
+        original = [recorded.args[1] for recorded in record.call_args_list]
+        self.assertEqual([event["status"] for event in original], [PENDING, "待执行", trace.SUCCESS])
+        names = ("__init__", "initialize", "order", "list_orders", "execute", "result", "refund",
+                 "change_address", "refund_count")
+        with patch.multiple(Backend, **dict.fromkeys(names, DEFAULT)) as methods:
+            for name, method in methods.items():
+                method.side_effect = AssertionError(f"replay called backend.{name}")
+            replayed = trace.replay(self.directory, "test-replay")
+            stdout = StringIO()
+            with (
+                patch.object(cli_module, "Path", return_value=self.directory),
+                patch.object(sys, "argv", ["supportactions", "replay", "test-replay"]),
+                redirect_stdout(stdout),
+            ):
+                cli_module.main()
+        self.assertEqual(replayed["events"], original)
+        self.assertEqual(replayed["steps"], [original[-1]])
+        self.assertEqual(replayed["status"], trace.SUCCESS)
+        output = stdout.getvalue().splitlines()
+        self.assertEqual(output[0], "运行号 test-replay")
+        self.assertEqual([json.loads(line) for line in output[1:-1]], original)
+        self.assertEqual(output[-1], "最终状态 成功")
+
+    def test_addresses_are_redacted_in_every_persisted_record(self):
+        with self.runner() as runner:
+            address_before = runner.backend.order("A-101")["address"]
+            shipped_address = runner.backend.order("A-103")["address"]
+            calls = [
+                Call("change_address", {"order_id": "A-101", "new_address": "青柚街9287号"}),
+                Call("change_address", {"order_id": "A-103", "new_address": "青柚巷9387号"}),
+            ]
+            run = runner.submit("A", calls)
+            self.assertEqual([step["status"] for step in run["steps"]], [trace.SUCCESS, REJECTED])
+            self.assertNotEqual(address_before, "青柚街***")
+            self.assertEqual(runner.backend.order("A-101")["address"], "青柚街***")
+            self.assertEqual(runner.backend.order("A-103")["address"], shipped_address)
+            stored_plan = runner.db.execute("SELECT plan FROM runs WHERE run_id = ?", (run["run_id"],)).fetchone()[0]
+            self.assertEqual([item["params"]["new_address"] for item in json.loads(stored_plan)],
+                             ["青柚街***", "青柚巷***"])
+            self.assertEqual([event["params"]["new_address"] for event in run["events"]],
+                             ["青柚街***", "青柚街***", "青柚巷***"])
+            dump = "\n".join(runner.db.iterdump())
+        log = self.directory / "traces" / f"{run['run_id']}.jsonl"
+        logged = log.read_text(encoding="utf-8")
+        self.assertEqual([json.loads(line) for line in logged.splitlines()], run["events"])
+
+        def demo_plan(message, account):
+            if "改地址" in message:
+                return calls[:1]
+            if message == "查订单 B-201":
+                return calls[1:]
+            return plan(message, account)
+
+        export = self.directory / "redacted-addresses.json"
+        with patch.object(cli_module, "plan", side_effect=demo_plan), redirect_stdout(StringIO()):
+            cli_module.demo(export)
+        output = export.read_text(encoding="utf-8")
+        cases = json.loads(output)["scenarios"]
+        for index, status, expected in ((1, trace.SUCCESS, "青柚街***"), (5, REJECTED, "青柚巷***")):
+            self.assertEqual(cases[index]["status"], status)
+            self.assertEqual(cases[index]["steps"][0]["params"]["new_address"], expected)
+        for private in ("9287", "9387"):
+            self.assertNotIn(private, dump)
+            self.assertNotIn(private, logged)
+            self.assertNotIn(private, output)
+
+    def test_unrecognized_order_and_account_numbers_are_redacted(self):
+        calls = [
+            Call("lookup_order", {"order_id": "A-1234567890"}),
+            Call("list_orders", {"account": "9876543210"}),
+        ]
+        with self.runner() as runner:
+            run = runner.submit("A", calls)
+            self.assertEqual([step["status"] for step in run["steps"]], [REJECTED, REJECTED])
+            self.assertEqual([step["params"] for step in run["steps"]],
+                             [{"order_id": "<无效值>"}, {"account": "<无效值>"}])
+            dump = "\n".join(runner.db.iterdump())
+        log = self.directory / "traces" / f"{run['run_id']}.jsonl"
+        for private in ("1234567890", "9876543210"):
+            self.assertNotIn(private, dump)
+            self.assertNotIn(private, log.read_text(encoding="utf-8"))
+
+    def test_invalid_run_id_is_rejected_before_storage(self):
+        with self.runner() as runner:
+            for run_id in ("invalid/run", "", "has space", "a" * 250):
+                with self.subTest(run_id=run_id), self.assertRaisesRegex(ValueError, "运行号"):
+                    runner.submit("A", plan("查订单 A-101", "A"), run_id=run_id)
+            for table in ("runs", "events"):
+                self.assertEqual(runner.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+        self.assertFalse((self.directory / "traces").exists())
+
+    def test_trace_redacts_addresses_and_demo_is_deterministic(self):
+        first = self.directory / "first.json"
+        second = self.directory / "second.json"
+        self.cli("demo", "--out", str(first))
+        hostname, username = "fixture-host.example.test", "fixture-demo-user"
+        with (
+            patch.dict(os.environ, {"HOSTNAME": hostname, "COMPUTERNAME": hostname,
+                                    "USER": username, "USERNAME": username, "LOGNAME": username}),
+            patch("socket.gethostname", return_value=hostname),
+            patch("getpass.getuser", return_value=username),
+            redirect_stdout(StringIO()),
+        ):
+            cli_module.demo(second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        output = second.read_text(encoding="utf-8")
+        for private in ("9287", "9387", "3186号", "4186号", hostname, username):
+            self.assertNotIn(private, output)
+        self.assertIn("青柚路***", output)
+
+        def check_paths(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    check_paths(key)
+                    check_paths(item)
+            elif isinstance(value, list):
+                for item in value:
+                    check_paths(item)
+            elif isinstance(value, str):
+                self.assertNotRegex(value, r"(?<![A-Za-z0-9_./\\-])(?:/|[A-Za-z]:[/\\]|\\\\)")
+
+        export = json.loads(output)
+        check_paths(export)
+        scenarios = export["scenarios"]
+        self.assertEqual([item["status"] for item in scenarios], [trace.SUCCESS] * 5 + [REJECTED] * 2)
+        self.assertEqual(scenarios[3]["refund_count"], 1)
+        self.assertEqual(scenarios[4]["steps"][0]["source"], "幂等查询")
