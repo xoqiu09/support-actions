@@ -60,8 +60,12 @@ class Approvals:
             "SELECT COUNT(*) FROM approval_votes WHERE run_id = ? AND step = ?", (run_id, step),
         ).fetchone()[0]
 
-    def decide(self, run_id: str, step: int, now: datetime, decision: str = PENDING,
+    def decide(self, run_id: str, step: int, now: datetime, decision: str | None = None,
                *, approver: str = "default") -> str:
+        if decision is None:
+            decision = PENDING
+        elif decision not in (APPROVED, REJECTED):
+            raise ValueError("审批决定只能是“已批准”或“已拒绝”")
         row = self.get(run_id, step)
         if row is None:
             raise ValueError("该步骤没有审批记录")
