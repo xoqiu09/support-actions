@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -101,6 +101,42 @@ class SupportActionsTests(unittest.TestCase):
             self.assertEqual(runner.backend.refund_count("A-102"), 0)
             self.assertEqual(runner.backend.order("A-103")["address"], "青柚东路***")
 
+    def test_address_questions_do_not_change_the_order(self):
+        with self.runner() as runner:
+            before = runner.backend.order("A-101")["address"]
+            for message in ("A-101 可以改地址吗？", "A-101 改地址 吗？", "A-101 改地址 可以吗"):
+                with self.subTest(message=message):
+                    run = runner.submit("A", plan(message, "A"))
+                    self.assertEqual(runner.backend.order("A-101")["address"], before)
+                    events = trace.replay(self.directory, run["run_id"])["events"]
+                    self.assertFalse(any(
+                        event["tool"] == "change_address" and event["status"] == trace.SUCCESS
+                        for event in events
+                    ))
+
+    def test_address_change_without_new_address_keeps_independent_lookup(self):
+        with self.runner() as runner:
+            before = runner.backend.order("A-101")["address"]
+            calls = plan("查订单 A-102", "A") + plan("A-101 改地址", "A")
+            lookup, change = runner.submit("A", calls)["steps"]
+            self.assertEqual(lookup["status"], trace.SUCCESS)
+            self.assertEqual(lookup["result"]["order_id"], "A-102")
+            self.assertEqual(change["tool"], "change_address")
+            self.assertEqual(change["status"], REJECTED)
+            self.assertEqual(change["error"], "工具参数缺失或包含未定义字段")
+            self.assertEqual(runner.backend.order("A-101")["address"], before)
+
+    def test_refund_rejects_multiple_distinct_order_ids(self):
+        with self.runner() as runner:
+            run = runner.submit("A", plan("查订单 A-101，给 A-102 退款 39 元", "A"))
+            self.assertEqual(runner.queue(), [])
+            self.assertEqual(run["steps"][0]["status"], REJECTED)
+            self.assertEqual(runner.backend.refund_count("A-101"), 0)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+
+            same_order = runner.submit("A", plan("查订单 A-102，给 A-102 退款 39 元", "A"))
+            self.assertEqual(same_order["steps"][0]["status"], PENDING)
+
     def test_refund_waits_for_approval_and_runs_once_after_restart(self):
         pending = self.cli("ask", "--account", "A", REFUND)
         self.assertIn("1 refund 待审", pending)
@@ -113,6 +149,32 @@ class SupportActionsTests(unittest.TestCase):
         self.assertEqual(self.cli("approve", run_id, "1"), approved)
         with self.runner() as runner:
             self.assertEqual(runner.run(run_id)["status"], trace.SUCCESS)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_approval_reports_committed_refund_when_trace_write_fails(self):
+        run_id = "trace-write-failure"
+        with Runner(self.directory) as runner:
+            runner.submit("A", plan("A-102 退款 39 元", "A"), run_id=run_id)
+
+        stdout, stderr = StringIO(), StringIO()
+        with (
+            patch.object(cli_module, "Path", return_value=self.directory),
+            patch.object(sys, "argv", ["supportactions", "approve", run_id, "1"]),
+            patch.object(Path, "replace", side_effect=OSError("模拟审计文件替换失败")),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            cli_module.main()
+        self.assertIn(f"运行号 {run_id}", stdout.getvalue())
+        self.assertIn('1 refund 成功 {"order_id": "A-102", "refunded_cents": 3900}', stdout.getvalue())
+        self.assertIn("审计文件写入失败", stderr.getvalue())
+
+        replay = self.cli("replay", run_id).splitlines()
+        self.assertEqual(replay[-1], "最终状态 成功")
+        events = (self.directory / "traces" / f"{run_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(events, replay[1:-1])
+        self.assertEqual(self.cli("approve", run_id, "1"), stdout.getvalue())
+        with self.runner() as runner:
             self.assertEqual(runner.backend.refund_count("A-102"), 1)
 
     def test_approved_refunds_cannot_exceed_remaining_amount(self):
@@ -168,6 +230,36 @@ class SupportActionsTests(unittest.TestCase):
                 )
             self.assertEqual(retry, result)
             self.assertEqual(restarted.backend.refund_count("A-102"), 1)
+
+    def test_invalid_approval_decision_leaves_refund_pending(self):
+        with self.runner() as runner:
+            run = runner.submit("A", plan("A-102 退款 39 元", "A"))
+            run_id = run["run_id"]
+            with self.assertRaisesRegex(ValueError, "审批决定"):
+                runner.decide(run_id, 1, "同意")
+            self.assertEqual(runner.queue()[0]["status"], PENDING)
+            self.assertEqual(runner.run(run_id), run)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+
+            approved = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual(approved["steps"][0]["result"]["refunded_cents"], 3900)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_invalid_approval_storage_decision_can_be_followed_by_approval(self):
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            for decision in ("同意", PENDING, EXPIRED):
+                with self.subTest(decision=decision):
+                    with self.assertRaisesRegex(ValueError, "审批决定"), runner.db:
+                        runner.approvals.decide(run_id, 1, self.now, decision)
+                    self.assertEqual(runner.approvals.get(run_id, 1)["status"], PENDING)
+            self.assertEqual(runner.approvals.decide(run_id, 1, self.now), PENDING)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+
+            approved = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual(approved["steps"][0]["result"]["refunded_cents"], 3900)
+            self.assertEqual(runner.decide(run_id, 1, APPROVED), approved)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
 
     def test_expired_or_rejected_approval_never_executes(self):
         with self.runner() as runner:
@@ -255,6 +347,23 @@ class SupportActionsTests(unittest.TestCase):
         with self.runner() as restarted:
             self.assertEqual(restarted.run(pending["run_id"]), run)
             self.assertEqual(restarted.backend.refund_count("A-102"), 0)
+
+    def test_refund_needing_review_stops_later_independent_steps(self):
+        run_id = "review-stops-plan"
+        calls = [
+            *plan("A-102 退款 39 元", "A"),
+            *plan("A-101 改地址 青柚路9287号", "A"),
+        ]
+        with self.runner(faults={f"{run_id}:1": "unknown"}) as runner:
+            before = runner.backend.order("A-101")["address"]
+            runner.submit("A", calls, run_id=run_id)
+            run = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual(run["status"], trace.REVIEW)
+            self.assertEqual(runner.backend.order("A-101")["address"], before)
+            self.assertEqual([step["step"] for step in run["steps"]], [1])
+        with self.runner() as restarted:
+            self.assertEqual(restarted.run(run_id), run)
+            self.assertEqual(restarted.backend.order("A-101")["address"], before)
 
     def test_definite_backend_failure_does_not_retry(self):
         with self.runner(faults={"test-failure:1": "failure"}) as runner:

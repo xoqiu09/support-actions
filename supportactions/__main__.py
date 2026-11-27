@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -91,6 +92,8 @@ def print_run(run: dict, *, replay: bool = False) -> None:
             message += f"（批准 {step['approvals_received']}/{step['approvals_required']}）"
         print(message)
     print("最终状态", run["status"])
+    if "trace_warning" in run:
+        print(run["trace_warning"], file=sys.stderr)
 
 
 def main() -> None:

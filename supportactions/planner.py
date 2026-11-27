@@ -35,19 +35,25 @@ def plan(message: str, account: str) -> list[Call]:
     if message == "坏计划":
         return [Call("list_orders", {"account": account}), Call("delete_order", {})]
 
-    order = re.search(r"[A-Z]-[0-9]+", message)
-    params = {"order_id": order.group()} if order else {}
+    orders = re.findall(r"[A-Z]-[0-9]+", message)
+    params = {"order_id": orders[0]} if orders else {}
     if "退款" in message:
+        if len(set(orders)) > 1:
+            del params["order_id"]
         amount = re.search(r"退款\s*(-?[0-9]+(?:\.[0-9]{1,2})?)\s*元", message)
         if amount:
             params["amount"] = float(amount.group(1))
         return [Call("refund", params)]
     if "改地址" in message:
-        address = message.partition("改地址")[2].strip()
-        if address:
+        address_change = re.fullmatch(r"\s*([A-Z]-[0-9]+)\s*改地址(?:\s+(\S.*?))?\s*", message)
+        if address_change is None:
+            return [Call("无法识别", {})]
+        address = address_change[2]
+        params = {"order_id": address_change[1]}
+        if address and not address.rstrip("。.!！").endswith(("?", "？", "吗", "么", "呢")):
             params["new_address"] = address
         return [Call("change_address", params)]
-    if order or "查订单" in message:
+    if orders or "查订单" in message:
         return [Call("lookup_order", params)]
     if "我的订单" in message:
         return [Call("list_orders", {"account": account})]

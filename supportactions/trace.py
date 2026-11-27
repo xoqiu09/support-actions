@@ -90,22 +90,26 @@ def latest(db: sqlite3.Connection, run_id: str) -> dict[int, dict]:
     return {event["step"]: event for event in events}
 
 
+def _event_payloads(db: sqlite3.Connection, run_id: str) -> list[str]:
+    return [row[0] for row in db.execute(
+        "SELECT payload FROM events WHERE run_id = ? ORDER BY seq", (run_id,),
+    )]
+
+
 def publish(directory: Path, db: sqlite3.Connection, run_id: str) -> Path:
     validate_run_id(run_id)
     # Serialize projection with writers so a concurrent process cannot overwrite a newer trace.
     with db:
         db.execute("BEGIN IMMEDIATE")
-        rows = db.execute(
-            "SELECT payload FROM events WHERE run_id = ? ORDER BY seq", (run_id,),
-        ).fetchall()
-        if not rows:
+        payloads = _event_payloads(db, run_id)
+        if not payloads:
             raise ValueError("运行号不存在")
         path = directory / "traces" / f"{run_id}.jsonl"
         path.parent.mkdir(exist_ok=True)
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
             temporary = Path(handle.name)
             try:
-                handle.writelines(row[0] + "\n" for row in rows)
+                handle.writelines(payload + "\n" for payload in payloads)
                 handle.flush()
                 temporary.replace(path)
             finally:
@@ -119,7 +123,11 @@ def replay(directory: Path, run_id: str) -> dict:
         raise ValueError("运行号不存在")
     # Recover the JSON Lines projection from committed audit events after an interrupted write.
     with closing(sqlite3.connect(database)) as db:
-        path = publish(directory, db, run_id)
+        try:
+            path = publish(directory, db, run_id)
+        except OSError:
+            events = [json.loads(payload) for payload in _event_payloads(db, run_id)]
+            return {**snapshot(run_id, events), "trace_warning": "审计文件写入失败"}
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     return snapshot(run_id, events)
 

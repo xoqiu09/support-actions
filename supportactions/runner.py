@@ -127,6 +127,8 @@ class Runner:
         return trace.replay(self.directory, run_id)
 
     def decide(self, run_id: str, step: int, decision: str, *, approver: str = "default") -> dict:
+        if decision not in (APPROVED, REJECTED):
+            raise ValueError("审批决定只能是“已批准”或“已拒绝”")
         approver = approver.strip().casefold()
         if not approver:
             raise ValueError("审批人不能为空")
@@ -178,7 +180,7 @@ class Runner:
             if event is None or event["status"] == PENDING:
                 event = events[step] = self._step(run_id, step, call, run["account"], events)
             status = event["status"]
-            if status == PENDING:
+            if status in (PENDING, trace.REVIEW):
                 break
             if status == REJECTED and TOOLS[call.tool].risk == "high":
                 approval = self.approvals.get(run_id, step)
