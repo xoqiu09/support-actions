@@ -84,10 +84,10 @@ def record(db: sqlite3.Connection, event: dict) -> None:
     )
 
 
-def latest(db: sqlite3.Connection, run_id: str) -> dict[int, str]:
+def latest(db: sqlite3.Connection, run_id: str) -> dict[int, dict]:
     rows = db.execute("SELECT payload FROM events WHERE run_id = ? ORDER BY seq", (run_id,))
     events = (json.loads(row[0]) for row in rows)
-    return {event["step"]: event["status"] for event in events}
+    return {event["step"]: event for event in events}
 
 
 def publish(directory: Path, db: sqlite3.Connection, run_id: str) -> Path:

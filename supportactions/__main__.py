@@ -1,12 +1,12 @@
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from . import trace
 from .approvals import APPROVED, REJECTED
-from .planner import plan
+from .planner import Call, plan
 from .runner import Runner
 
 
@@ -30,15 +30,48 @@ def demo(out: Path) -> None:
             forbidden = ask("demo-forbidden", "查订单 B-201")
             invalid = ask("demo-invalid", "坏计划")
 
+            injection = runner.submit("B", [
+                *plan("查订单 B-202", "B"),
+                *plan("查订单 B-203", "B"),
+                Call("refund", {}, args_from={"order_id": (2, "order_id"), "amount": (2, "note")}),
+            ], run_id="demo-injection")
+
+            now = now.replace(hour=23, minute=58, second=59)
+            minute_limit = runner.submit("A", plan("查订单 A-101", "A") * 11, run_id="demo-minute-limit")
+            now += timedelta(seconds=1)
+            minute_reset = ask("demo-minute-reset", "查订单 A-101")
+
+            runner.submit("B", plan("B-201 退款 10 元", "B") * 3, run_id="demo-day-limit")
+            for step in (1, 2, 3):
+                day_limit = runner.decide("demo-day-limit", step, APPROVED)
+            now += timedelta(minutes=1)
+            runner.submit("B", plan("B-201 退款 10 元", "B"), run_id="demo-day-reset")
+            day_reset = runner.decide("demo-day-reset", 1, APPROVED)
+
+            ask("demo-cap", "A-103 退款 600 元")
+            runner.decide("demo-cap", 1, APPROVED, approver="reviewer-a")
+            repeated = runner.decide("demo-cap", 1, APPROVED, approver="reviewer-a")
+            cap = runner.decide("demo-cap", 1, APPROVED, approver="reviewer-b")
+            cap["duplicate_approval_status"] = repeated["status"]
+
     cases = [
         ("正常查单", lookup), ("改地址", change), ("退款审批", refund),
         ("重复批准", duplicate), ("超时后查询确认", timeout),
         ("越权被拒", forbidden), ("坏计划被拒", invalid),
     ]
-    export = {"brand": "青柚家电", "scenarios": [{"name": name, **run} for name, run in cases]}
+    m2_cases = [
+        ("可疑订单备注", injection), ("每分钟工具限额", minute_limit), ("分钟限额重置", minute_reset),
+        ("每日退款限额", day_limit), ("每日限额重置", day_reset), ("大额退款双人审批", cap),
+    ]
+    export = {
+        "brand": "青柚家电",
+        "scenarios": [{"name": name, **run} for name, run in cases],
+        "m2_scenarios": [{"name": name, **run} for name, run in m2_cases],
+    }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(export, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"已写入演示 JSON（{len(cases)} 个场景）")
+    print(f"另含 {len(m2_cases)} 个 M2 场景")
 
 
 def print_run(run: dict, *, replay: bool = False) -> None:
@@ -52,6 +85,10 @@ def print_run(run: dict, *, replay: bool = False) -> None:
             message += f"（{step['error']}）"
         elif step["result"] is not None:
             message += " " + json.dumps(step["result"], ensure_ascii=False, sort_keys=True)
+        if "flags" in step:
+            message += f"（{'、'.join(step['flags'])}）"
+        if "approvals_required" in step:
+            message += f"（批准 {step['approvals_received']}/{step['approvals_required']}）"
         print(message)
     print("最终状态", run["status"])
 
@@ -68,6 +105,8 @@ def main() -> None:
         command.add_argument("run_id")
         if name != "replay":
             command.add_argument("step", type=int)
+        if name == "approve":
+            command.add_argument("--approver", default="default")
     example = commands.add_parser("demo")
     example.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -87,10 +126,15 @@ def main() -> None:
                     if not queue:
                         print("审批队列为空")
                     for item in queue:
-                        print(item["run_id"], item["step"], item["status"], "截止", item["deadline"])
+                        message = f"{item['run_id']} {item['step']} {item['status']} 截止 {item['deadline']}"
+                        if "approvals_required" in item:
+                            message += f"（批准 {item['approvals_received']}/{item['approvals_required']}）"
+                        print(message)
                 else:
                     decision = APPROVED if args.command == "approve" else REJECTED
-                    print_run(runner.decide(args.run_id, args.step, decision))
+                    print_run(runner.decide(
+                        args.run_id, args.step, decision, approver=getattr(args, "approver", "default"),
+                    ))
     except ValueError as exc:
         parser.exit(1, f"{exc}\n")
 
