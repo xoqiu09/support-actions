@@ -1,6 +1,6 @@
 # support-actions
 
-青柚家电客服工具的本地演示。客服 Agent 要能查询订单、改地址和发起退款。这个项目演示怎样限制它能调用的工具、校验参数和账户权限、让人批准退款，并在执行超时或重复批准时防止重复退款。审计记录可以按运行号回放。
+青柚家电客服工具的本地演示。客服 Agent 要能查询订单、改地址和发起退款。这个项目演示工具白名单、参数和账户权限校验、退款审批，以及执行超时或重复批准时怎样防止重复退款。M2 加入可疑订单备注标记、账户限额和大额退款双人审批。审计记录可以按运行号回放。
 
 ## 运行
 
@@ -22,15 +22,29 @@ pending=$(/opt/homebrew/bin/python3 -m supportactions ask --account A "我的订
 printf '%s\n' "$pending"
 run_id=$(printf '%s\n' "$pending" | awk 'NR == 1 {print $2}')
 /opt/homebrew/bin/python3 -m supportactions reject "$run_id" 1
+lookup=$(/opt/homebrew/bin/python3 -m supportactions ask --account B "查订单 B-202")
+printf '%s\n' "$lookup"
+run_id=$(printf '%s\n' "$lookup" | awk 'NR == 1 {print $2}')
+/opt/homebrew/bin/python3 -m supportactions replay "$run_id"
+pending=$(/opt/homebrew/bin/python3 -m supportactions ask --account A "A-103 退款 600 元")
+printf '%s\n' "$pending"
+run_id=$(printf '%s\n' "$pending" | awk 'NR == 1 {print $2}')
+/opt/homebrew/bin/python3 -m supportactions approve "$run_id" 1 --approver reviewer-a
+/opt/homebrew/bin/python3 -m supportactions approve "$run_id" 1 --approver reviewer-a
+/opt/homebrew/bin/python3 -m supportactions approve "$run_id" 1 --approver reviewer-b
 /opt/homebrew/bin/python3 -m supportactions demo --out .support-actions/demo.json
 ```
 
-- `ask` 按固定规则生成计划，打印运行号和各步状态。示例先列出 A 的订单、查单和改地址，再提交退款。退款停在“待审”。
-- `approvals` 显示审批状态和截止时间。审批自入队起有效五分钟。`approve` 后面填运行号和步骤号。对同一步重复批准会返回已有结果。`reject` 会结束本次运行，余下步骤记为“未执行”。
-- `replay` 按原顺序打印每条审计事件和最终状态，业务系统调用次数为零。地址记录像 `青柚路***`，金额结果以分为单位。
-- `demo` 用独立的虚构订单和固定时钟生成七个场景，写到指定文件。JSON 可供网站演示页读取，重复生成的文件逐字节一致。
+- `ask` 按固定规则生成计划，打印运行号和各步状态。退款提交后停在“待审”。查 B-202 会显示“可疑指令”。
+- `approvals` 显示审批状态和截止时间。审批自入队起有效五分钟。`approve` 后面填运行号和步骤号，重复批准会返回已有结果。`--approver` 填演示审批人标识，省略时使用默认审批人。系统去掉首尾空格并忽略大小写，只保存用于去重的标识摘要。`reject` 会结束本次运行，余下步骤记为“未执行”。
+- `replay` 按原顺序打印每条审计事件和最终状态，业务系统调用次数为零。记录保留可疑标记和大额审批计数。地址记录像 `青柚路***`，金额结果以分为单位。
+- `demo` 使用独立的虚构数据和固定时钟。导出 JSON 的 `scenarios` 有七个 M1 场景，`m2_scenarios` 有六个 M2 场景，展示可疑备注、超限拒绝、边界重置和双人审批。重复生成的文件逐字节一致。
 
 `.support-actions/state.sqlite3` 保存本地运行状态、审批和假业务数据，`.support-actions/traces/` 保存每次运行的 JSON Lines。新写入的计划和订单地址会遮住门牌号。业务写入和幂等结果在同一个 SQLite 事务中记录，退款入账时也会在该事务内核对剩余可退金额。幂等范围是同一运行号和同一步骤号，每次新的 `ask` 都会生成新的运行号。每次执行超时后都先按幂等键查结果，查不到才重试，最多重试两次。仍不明时停在“待人工核对”。
+
+订单备注只作为工具结果数据。识别到“忽略之前的规则”“直接退款”“调用 refund”一类文字时，审计记录只保留标记。引用可疑备注作为参数的步骤会被拒绝。同一条结果中的结构化订单号可用于后续查单，仍需通过常规校验。每个账户默认每分钟可执行 10 次工具、每天可入账 2 笔退款。执行前核对限额，内部幂等查询和重试计入同一次工具调用。分钟和日期按 UTC 对齐，演示和测试用假时钟直接跨过边界。M1 数据库升级时根据已有审计记录恢复当前分钟调用数和当天入账退款数，再次打开只延续已有计数。
+
+单笔超过 500 元时需要两位不同的审批人。恰好 500 元仍需一位审批人。Python 调用方可通过 `Runner` 的 `calls_per_minute`、`refunds_per_day` 和 `refund_cap_cents` 配置三个数值，金额上限以分为单位。
 
 ## 每个测试验证什么
 
@@ -55,11 +69,23 @@ run_id=$(printf '%s\n' "$pending" | awk 'NR == 1 {print $2}')
 | `test_trace_redacts_addresses_and_demo_is_deterministic` | 比较两次导出的字节，递归检查 POSIX 和 Windows 绝对路径，并检查门牌号、测试主机名、测试用户名和关键场景结果。 |
 | `test_unknown_timeout_tries_twice_more_then_stops` | 初次执行和两次重试都不明时转人工核对，重复批准或重启均不会再自动重试。 |
 | `test_unrecognized_order_and_account_numbers_are_redacted` | 误填的长订单号和账户号被拒绝，数据库和 JSON Lines 只留遮罩。 |
+| `test_order_notes_are_flagged_in_replay_without_refund` | 三种指令单独出现时回放均有标记，普通送货备注无标记。四次查单都没有新增审批或退款。 |
+| `test_step_using_flagged_tool_arguments_is_refused` | 从同一结果读取结构化订单号能查单，引用可疑备注的退款被拒且不入队。 |
+| `test_m1_usage_survives_upgrade_and_reopen` | 旧库恢复当前限额，第 11 次调用和当天第 3 笔退款被拒，再次打开时计数不重复。 |
+| `test_tool_limit_allows_exactly_ten_then_resets` | 第十次调用成功，第十一次在重启后仍被拒，其他账户可以调用，下一分钟恢复。 |
+| `test_approved_refund_still_obeys_current_minute_limit` | 退款待审期间查单用完额度，即使批准退款也不会入账。 |
+| `test_refund_limit_counts_two_effects_per_account_and_resets_at_midnight` | 两笔退款成功，超时后确认的退款只计一次，第三笔被拒，其他账户可用，跨日恢复。 |
+| `test_configured_daily_refund_limit_survives_minute_change` | 日限额设为 1 笔后，同日跨分钟仍拒绝第二笔，跨午夜后可再次入账。 |
+| `test_large_refund_requires_distinct_approvers_after_restart` | 超过 500 元时一人批准后待审，重启后同一审批人再批准仍待审，第二位批准后只入账一次。 |
+| `test_approver_vote_deduplicates_without_storing_raw_identifier` | 路径形式的审批人标识只计一票，数据库不保存原文。 |
+| `test_existing_approver_vote_is_preserved_when_hashed_on_upgrade` | 旧版已投的票升级后仍有效，数据库只保留标识摘要。 |
+| `test_exact_cap_uses_one_approval_and_configured_cap_is_used` | 恰好 500 元只需一位审批人。更换金额上限后，新入队退款按新上限处理，已入队的审批人数要求在重启后继续生效。 |
+| `test_export_shows_m2_scenarios` | 检查可疑备注和限额拒绝、分钟重置及双人审批，并核对同一订单跨日后实际退款的工具和入账金额。 |
 
-## M1 未做
+## 未做
 
-真实模型、网络调用、网页和多轮对话记忆均未接入。订单和业务结果均为虚构数据。
+真实模型、网络调用、网页和多轮对话记忆均未接入。可疑文字识别只覆盖演示规则，审批人标识由本地命令提供，未接入身份认证。订单和退款均为虚构数据。
 
 ## English overview
 
-A standard-library Python demo of customer-support tool calls. A rule-based planner proposes actions, and the runner enforces a tool allow-list, argument checks, account ownership, and human approval for refunds. SQLite stores the simulated effects and idempotency keys. JSON Lines support audit replay without business calls, and the demo command exports deterministic JSON.
+A standard-library Python demo of customer-support tool calls. A rule-based planner proposes actions. The runner checks tool access and account ownership, flags suspicious tool results, enforces per-account limits, and requires two approvers for large refunds. SQLite stores the simulated effects and idempotency keys. JSON Lines support audit replay without business calls, and the demo command exports deterministic JSON.

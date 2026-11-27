@@ -20,9 +20,11 @@ class Backend:
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY, account TEXT, paid_cents INTEGER,
-                shipped INTEGER, address TEXT
+                shipped INTEGER, address TEXT, note TEXT
             )
         """)
+        if not any(row["name"] == "note" for row in self.db.execute("PRAGMA table_info(orders)")):
+            self.db.execute("ALTER TABLE orders ADD COLUMN note TEXT")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS effects (
                 effect_key TEXT PRIMARY KEY, result TEXT
@@ -32,9 +34,11 @@ class Backend:
             CREATE TABLE IF NOT EXISTS refunds (order_id TEXT, amount_cents INTEGER)
         """)
         fixture = Path(__file__).resolve().parent.parent / "data" / "orders.json"
+        orders = json.loads(fixture.read_text(encoding="utf-8"))
         self.db.executemany(
-            "INSERT OR IGNORE INTO orders VALUES (:order_id, :account, :paid_cents, :shipped, :address)",
-            json.loads(fixture.read_text(encoding="utf-8")),
+            """INSERT OR IGNORE INTO orders (order_id, account, paid_cents, shipped, address, note)
+               VALUES (:order_id, :account, :paid_cents, :shipped, :address, :note)""",
+            ({"note": None, **order} for order in orders),
         )
 
     def order(self, order_id: str) -> sqlite3.Row | None:

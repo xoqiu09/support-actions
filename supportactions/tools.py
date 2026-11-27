@@ -21,7 +21,10 @@ def money_cents(value) -> int:
 
 def lookup_order(backend: Backend, order_id: str) -> dict:
     row = backend.order(order_id)
-    return {"order_id": order_id, "paid_cents": row["paid_cents"], "shipped": bool(row["shipped"])}
+    result = {"order_id": order_id, "paid_cents": row["paid_cents"], "shipped": bool(row["shipped"])}
+    if row["note"]:
+        result["note"] = row["note"]
+    return result
 
 
 def refund(backend: Backend, order_id: str, amount) -> dict:
