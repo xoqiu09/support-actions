@@ -378,6 +378,25 @@ class SupportActionsTests(unittest.TestCase):
             self.assertEqual((result["status"], runner.backend.refund_count("A-102")), (EXPIRED, 0))
             self.assertEqual(datetime.fromisoformat(queued["deadline"]), deadline)
 
+    def test_refund_approval_treats_naive_clock_and_legacy_deadline_as_utc(self):
+        self.now = datetime(2026, 1, 1, 12)
+        deadline = self.now + TTL
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            queued = runner.queue()[0]
+            self.assertEqual(queued["status"], PENDING)
+            with runner.db:
+                runner.db.execute("UPDATE approvals SET deadline = ? WHERE run_id = ? AND step = 1",
+                                  (deadline.isoformat(), run_id))
+
+        self.now = self.now.replace(minute=1, tzinfo=timezone.utc)
+        with self.runner() as runner:
+            self.assertEqual(runner.queue()[0]["status"], PENDING)
+            self.now = deadline.replace(tzinfo=timezone.utc)
+            result = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual((result["status"], runner.backend.refund_count("A-102")), (EXPIRED, 0))
+        self.assertEqual(queued["deadline"], self.now.isoformat())
+
     def test_rejected_approval_stops_remaining_independent_steps(self):
         calls = [
             *plan(REFUND, "A"),
@@ -503,6 +522,25 @@ class SupportActionsTests(unittest.TestCase):
         self.assertEqual(output[0], "运行号 test-replay")
         self.assertEqual([json.loads(line) for line in output[1:-1]], original)
         self.assertEqual(output[-1], "最终状态 成功")
+
+    def test_replay_reads_committed_events_while_another_connection_holds_write_lock(self):
+        run_id = "busy-replay"
+        path = self.directory / "traces" / f"{run_id}.jsonl"
+        with self.runner() as writer:
+            original = writer.submit("A", plan("查订单 A-101", "A"), run_id=run_id)
+            self.assertEqual(original["status"], trace.SUCCESS)
+            self.assertEqual(original["steps"][0]["result"]["order_id"], "A-101")
+            path.unlink()
+            with writer.db, patch.object(Backend, "__init__", side_effect=AssertionError("replay opened backend")):
+                writer.db.execute("BEGIN IMMEDIATE")
+                replayed = trace.replay(self.directory, run_id)
+                self.assertEqual(replayed, {**original, "trace_warning": "审计文件写入失败"})
+                self.assertFalse(path.exists())
+                with self.assertRaisesRegex(ValueError, "运行号不存在"):
+                    trace.replay(self.directory, "missing-run")
+
+        self.assertEqual(trace.replay(self.directory, run_id), original)
+        self.assertTrue(path.is_file())
 
     def test_trace_files_keep_run_ids_that_differ_only_by_case(self):
         replace, read_text = Path.replace, Path.read_text

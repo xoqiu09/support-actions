@@ -157,12 +157,18 @@ def replay(directory: Path, run_id: str) -> dict:
     if not database.is_file():
         raise ValueError("运行号不存在")
     # Recover the JSON Lines projection from committed audit events after an interrupted write.
-    with closing(sqlite3.connect(database)) as db:
-        try:
+    try:
+        with closing(sqlite3.connect(database, timeout=0)) as db:
             path = publish(directory, db, run_id)
-        except OSError:
-            events = [json.loads(payload) for payload in _event_payloads(db, run_id)]
-            return {**snapshot(run_id, events), "trace_warning": "审计文件写入失败"}
+    except (OSError, sqlite3.OperationalError) as error:
+        if isinstance(error, sqlite3.OperationalError) and str(error) != "database is locked":
+            raise
+        with closing(sqlite3.connect(database)) as db:
+            payloads = _event_payloads(db, run_id)
+        if not payloads:
+            raise ValueError("运行号不存在")
+        events = [json.loads(payload) for payload in payloads]
+        return {**snapshot(run_id, events), "trace_warning": "审计文件写入失败"}
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     return snapshot(run_id, events)
 

@@ -15,6 +15,12 @@ def _approver_digest(approver: str) -> bytes:
     return sha256(approver.encode("utf-8")).digest()
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class Approvals:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
@@ -69,11 +75,9 @@ class Approvals:
                                 (corrected.isoformat(), row["run_id"], row["step"]))
 
     def enqueue(self, run_id: str, step: int, now: datetime, required: int) -> None:
-        if now.utcoffset() is not None:
-            now = now.astimezone(timezone.utc)
         self.db.execute(
             "INSERT INTO approvals VALUES (?, ?, ?, ?, ?)",
-            (run_id, step, PENDING, (now + TTL).isoformat(), required),
+            (run_id, step, PENDING, (_as_utc(now) + TTL).isoformat(), required),
         )
 
     def get(self, run_id: str, step: int) -> sqlite3.Row | None:
@@ -100,7 +104,8 @@ class Approvals:
             raise ValueError("该步骤没有审批记录")
         if row["status"] != PENDING:
             return row["status"]
-        status = EXPIRED if now >= datetime.fromisoformat(row["deadline"]) else decision
+        deadline = _as_utc(datetime.fromisoformat(row["deadline"]))
+        status = EXPIRED if _as_utc(now) >= deadline else decision
         if status == APPROVED and row["required"] == 2:
             self.db.execute("INSERT OR IGNORE INTO approval_votes VALUES (?, ?, ?)",
                             (run_id, step, _approver_digest(approver)))
