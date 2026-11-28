@@ -1,5 +1,8 @@
+import errno
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import unittest
@@ -575,6 +578,83 @@ class SupportActionsTests(unittest.TestCase):
             for table in ("runs", "events"):
                 self.assertEqual(runner.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
         self.assertFalse((self.directory / "traces").exists())
+
+    def test_empty_plan_is_rejected_without_reserving_run_id(self):
+        with self.runner() as runner:
+            with self.assertRaisesRegex(ValueError, "^计划不能为空$"):
+                runner.submit("A", [], run_id="empty")
+            self.assertEqual(runner.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
+            run = runner.submit("A", plan("查订单 A-101", "A"), run_id="empty")
+            self.assertEqual(run["status"], trace.SUCCESS)
+            self.assertEqual(run["steps"][0]["result"]["order_id"], "A-101")
+
+    def test_demo_preserves_previous_export_when_disk_fills(self):
+        out = self.directory / "demo.json"
+        self.cli("demo", "--out", str(out))
+        original = out.read_bytes()
+        original_json = json.loads(original)
+        original_open = io.open
+        written = []
+
+        def open_with_disk_full(file, mode="r", *args, **kwargs):
+            handle = original_open(file, mode, *args, **kwargs)
+            if mode != "w":
+                return handle
+            opened_file = os.fstat(handle.fileno())
+            if any(os.path.samestat(opened_file, entry.stat()) for entry in out.parent.iterdir()):
+                write = handle.write
+
+                def partial_write(data):
+                    written.append(write(data[:12]))
+                    raise OSError(errno.ENOSPC, "No space left on device")
+
+                handle.write = partial_write
+            return handle
+
+        with patch("io.open", side_effect=open_with_disk_full), self.assertRaises(OSError) as failure:
+            cli_module.demo(out)
+
+        self.assertEqual(failure.exception.errno, errno.ENOSPC)
+        self.assertEqual(written, [12])
+        self.assertEqual(out.read_bytes(), original)
+        self.assertEqual(json.loads(out.read_bytes()), original_json)
+        self.assertEqual(list(out.parent.iterdir()), [out])
+
+    def test_demo_preserves_existing_export_permissions(self):
+        out = self.directory / "demo.json"
+        out.parent.mkdir()
+        out.write_text("{}", encoding="utf-8")
+        out.chmod(0o644)
+
+        self.cli("demo", "--out", str(out))
+
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o644)
+        self.assertEqual(json.loads(out.read_bytes())["brand"], "青柚家电")
+
+    def test_demo_new_export_respects_umask(self):
+        out = self.directory / "demo.json"
+        previous_umask = os.umask(0o027)
+        try:
+            self.cli("demo", "--out", str(out))
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o640)
+
+    def test_demo_updates_symlink_target_without_replacing_link(self):
+        out = self.directory / "demo.json"
+        out.parent.mkdir()
+        target = self.directory.parent / "real.json"
+        target.write_text("{}", encoding="utf-8")
+        link_target = Path("..") / target.name
+        out.symlink_to(link_target)
+
+        self.cli("demo", "--out", str(out))
+
+        self.assertTrue(out.is_symlink())
+        self.assertEqual(out.readlink(), link_target)
+        self.assertEqual(json.loads(target.read_bytes())["brand"], "青柚家电")
 
     def test_trace_redacts_addresses_and_demo_is_deterministic(self):
         first = self.directory / "first.json"
