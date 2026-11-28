@@ -114,6 +114,8 @@ class Runner:
                     dep if type(dep) is int and 1 <= dep < step else None for dep in call.args_from
                 ]
             stored_calls.append(stored_call)
+        if not stored_calls:
+            raise ValueError("计划不能为空")
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             self.db.execute(

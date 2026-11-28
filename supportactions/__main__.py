@@ -1,9 +1,12 @@
 import argparse
 import json
+import os
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 from . import trace
 from .approvals import APPROVED, REJECTED
@@ -70,7 +73,23 @@ def demo(out: Path) -> None:
         "m2_scenarios": [{"name": name, **run} for name, run in m2_cases],
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(export, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    out = out.resolve()
+    try:
+        previous_mode = stat.S_IMODE(out.stat().st_mode)
+    except FileNotFoundError:
+        previous_mode = None
+
+    temporary = out.with_name(f".{uuid4().hex}.tmp")
+    creation_mode = 0o666 if previous_mode is None else 0o600
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, creation_mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(export, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        if previous_mode is not None:
+            temporary.chmod(previous_mode)
+        temporary.replace(out)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"已写入演示 JSON（{len(cases)} 个场景）")
     print(f"另含 {len(m2_cases)} 个 M2 场景")
 
