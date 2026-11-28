@@ -95,6 +95,8 @@ class Approvals:
 
     def decide(self, run_id: str, step: int, now: datetime, decision: str | None = None,
                *, approver: str = "default") -> str:
+        if type(step) is not int or step < 1:
+            raise ValueError("步骤号须为正整数")
         if decision is None:
             decision = PENDING
         elif decision not in (APPROVED, REJECTED):

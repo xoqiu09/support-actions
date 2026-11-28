@@ -79,7 +79,7 @@ class SupportActionsTests(unittest.TestCase):
 
     def test_lookup_rejects_malformed_order_id(self):
         with self.runner() as runner:
-            for order_id in ("A-101X", "A-101Ｘ", "AA-101"):
+            for order_id in ("A-101X", "A-101Ｘ", "AA-101", "A-101X发货了吗"):
                 with self.subTest(order_id=order_id):
                     step = runner.submit("A", plan(f"查订单 {order_id}", "A"))["steps"][0]
                     self.assertEqual(
@@ -89,11 +89,12 @@ class SupportActionsTests(unittest.TestCase):
 
     def test_lookup_accepts_complete_order_id(self):
         with self.runner() as runner:
-            for message in ("查订单 A-101", "查订单A-101？"):
+            for message in ("查订单 A-101", "查订单A-101？", "查订单A-101发货了吗？"):
                 with self.subTest(message=message):
                     step = runner.submit("A", plan(message, "A"))["steps"][0]
                     self.assertEqual(step["status"], trace.SUCCESS)
                     self.assertEqual(step["result"]["order_id"], "A-101")
+                    self.assertIs(step["result"]["shipped"], False)
 
     def test_invalid_arguments_block_only_that_step_and_its_dependents(self):
         calls = [
@@ -188,6 +189,38 @@ class SupportActionsTests(unittest.TestCase):
         with self.runner() as runner:
             self.assertEqual(runner.run(run_id)["status"], trace.SUCCESS)
             self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_cli_reject_reports_when_refund_is_already_approved(self):
+        pending = self.cli("ask", "--account", "A", "A-102 退款 39 元")
+        run_id = pending.splitlines()[0].split()[1]
+        approved = self.cli("approve", run_id, "1")
+        self.assertIn("1 refund 成功", approved)
+
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.cli("reject", run_id, "1")
+        self.assertEqual(failure.exception.returncode, 1)
+        self.assertEqual(failure.exception.stderr, "该退款已批准，本次拒绝未生效\n")
+        self.assertEqual(failure.exception.stdout, "")
+
+        self.assertEqual(self.cli("approve", run_id, "1"), approved)
+        with self.runner() as runner:
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_cli_approve_reports_when_refund_is_already_rejected(self):
+        pending = self.cli("ask", "--account", "A", "A-102 退款 39 元")
+        run_id = pending.splitlines()[0].split()[1]
+        rejected = self.cli("reject", run_id, "1")
+        self.assertIn("最终状态 已拒绝", rejected)
+
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.cli("approve", run_id, "1")
+        self.assertEqual(failure.exception.returncode, 1)
+        self.assertEqual(failure.exception.stderr, "该退款已拒绝，本次批准未生效\n")
+        self.assertEqual(failure.exception.stdout, "")
+
+        self.assertEqual(self.cli("reject", run_id, "1"), rejected)
+        with self.runner() as runner:
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
 
     def test_approval_reports_committed_refund_when_trace_write_fails(self):
         run_id = "trace-write-failure"
@@ -297,6 +330,31 @@ class SupportActionsTests(unittest.TestCase):
                 )
             self.assertEqual(retry, result)
             self.assertEqual(restarted.backend.refund_count("A-102"), 1)
+
+    def test_invalid_approval_step_leaves_refund_pending(self):
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            for step in (True, False, 0, -1, 1.0, "1"):
+                with self.assertRaisesRegex(ValueError, "步骤号须为正整数", msg=repr(step)):
+                    runner.decide(run_id, step, APPROVED)
+            self.assertEqual(runner.queue()[0]["status"], PENDING)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+
+            approved = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual(approved["steps"][0]["result"]["refunded_cents"], 3900)
+            self.assertEqual(runner.backend.refund_count("A-102"), 1)
+
+    def test_invalid_approval_storage_step_leaves_refund_pending(self):
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            with patch.object(runner.approvals, "get", wraps=runner.approvals.get) as get_approval:
+                with runner.db, self.assertRaisesRegex(ValueError, "步骤号须为正整数"):
+                    runner.approvals.decide(run_id, True, self.now, APPROVED)
+                get_approval.assert_not_called()
+
+            self.assertEqual(runner.run(run_id)["status"], PENDING)
+            self.assertEqual(runner.approvals.get(run_id, 1)["status"], PENDING)
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
 
     def test_invalid_approval_decision_leaves_refund_pending(self):
         with self.runner() as runner:
