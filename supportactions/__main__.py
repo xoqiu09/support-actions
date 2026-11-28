@@ -14,6 +14,13 @@ from .planner import Call, plan
 from .runner import Runner
 
 
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
 def demo(out: Path) -> None:
     now = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     with TemporaryDirectory() as directory:
@@ -73,7 +80,24 @@ def demo(out: Path) -> None:
         "m2_scenarios": [{"name": name, **run} for name, run in m2_cases],
     }
     out.parent.mkdir(parents=True, exist_ok=True)
+    requested = out
     out = out.resolve()
+    database_path = Path(".support-actions/state.sqlite3")
+    databases = {
+        database_path.resolve(),
+        (requested.parent.parent / database_path).resolve(),
+        (out.parent.parent / database_path).resolve(),
+    }
+    database_error = "演示输出不能覆盖业务数据库"
+    case_variant = False
+    for database in databases:
+        if out == database or _same_file(out, database):
+            raise ValueError(database_error)
+        if out.name.lower() == database.name.lower() and _same_file(out.parent, database.parent):
+            if out.name == database.name:
+                raise ValueError(database_error)
+            case_variant = True
+
     try:
         previous_mode = stat.S_IMODE(out.stat().st_mode)
     except FileNotFoundError:
@@ -84,6 +108,9 @@ def demo(out: Path) -> None:
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, creation_mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # The staging file can test case matching even before the database exists.
+            if case_variant and _same_file(temporary, temporary.with_suffix(".TMP")):
+                raise ValueError(database_error)
             handle.write(json.dumps(export, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         if previous_mode is not None:
             temporary.chmod(previous_mode)

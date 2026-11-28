@@ -23,6 +23,8 @@ def _quota_windows(now: datetime) -> tuple[str, str]:
 class Runner:
     def __init__(self, directory: Path, *, clock=None, faults: dict[str, str] | None = None,
                  calls_per_minute: int = 10, refunds_per_day: int = 2, refund_cap_cents: int = 50_000):
+        if type(refund_cap_cents) is not int or refund_cap_cents < 0:
+            raise ValueError("退款门槛无效，须为以分计的非负整数")
         self.directory = directory
         self.clock = clock or partial(datetime.now, timezone.utc)
         self.calls_per_minute = calls_per_minute

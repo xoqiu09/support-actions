@@ -41,9 +41,10 @@ class SupportActionsTests(unittest.TestCase):
     def runner(self, **kwargs):
         return Runner(self.directory, clock=lambda: self.now, **kwargs)
 
-    def cli(self, *args):
+    def cli(self, *args, cwd=None):
         return subprocess.run(
-            [sys.executable, "-m", "supportactions", *args], cwd=self.directory.parent,
+            [sys.executable, "-m", "supportactions", *args],
+            cwd=self.directory.parent if cwd is None else cwd,
             env={**os.environ, "PYTHONPATH": str(ROOT)}, capture_output=True, check=True,
             text=True, encoding="utf-8",
         ).stdout
@@ -597,6 +598,23 @@ class SupportActionsTests(unittest.TestCase):
         self.assertEqual([event["result"]["order_id"] for event in events], ["A-101", "A-102"])
         self.assertEqual(events[0], original["events"][0])
 
+    def test_address_redaction_keeps_road_after_subdistrict(self):
+        addresses = (
+            ("粤海街道科苑路18号", "粤海街道科苑路***"),
+            ("粤海街道海天路26号", "粤海街道海天路***"),
+            ("学院路街道科苑路18号", "学院路街道科苑路***"),
+            ("学院路街道海天路26号", "学院路街道海天路***"),
+        )
+        with self.runner() as runner:
+            for address, expected in addresses:
+                with self.subTest(address=address):
+                    run = runner.submit("A", plan(f"A-101 改地址 {address}", "A"))
+                    self.assertEqual(run["status"], trace.SUCCESS)
+                    replayed = trace.replay(self.directory, run["run_id"])
+                    stored = runner.backend.order("A-101")["address"]
+                    audit_addresses = {event["params"]["new_address"] for event in replayed["events"]}
+                    self.assertEqual((stored, audit_addresses), (expected, {expected}))
+
     def test_addresses_are_redacted_in_every_persisted_record(self):
         with self.runner() as runner:
             address_before = runner.backend.order("A-101")["address"]
@@ -674,6 +692,49 @@ class SupportActionsTests(unittest.TestCase):
             run = runner.submit("A", plan("查订单 A-101", "A"), run_id="empty")
             self.assertEqual(run["status"], trace.SUCCESS)
             self.assertEqual(run["steps"][0]["result"]["order_id"], "A-101")
+
+    def test_demo_rejects_database_output_and_preserves_refund(self):
+        with self.runner() as runner:
+            run = runner.submit("A", plan("A-101 退款 39 元", "A"))
+            runner.decide(run["run_id"], 1, APPROVED)
+
+        database = self.directory / "state.sqlite3"
+        alias = self.directory.parent / "demo.json"
+        alias.symlink_to(database)
+        for output, cwd in (
+            (Path(".support-actions/state.sqlite3"), None),
+            (alias, None),
+            (database, self.enter_tempdir()),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                self.cli("demo", "--out", str(output), cwd=cwd)
+            self.assertEqual(failure.exception.returncode, 1)
+            self.assertEqual(failure.exception.stderr.strip(), "演示输出不能覆盖业务数据库")
+
+        with self.runner() as runner:
+            refunds = runner.db.execute("SELECT order_id, amount_cents FROM refunds").fetchall()
+            self.assertEqual([tuple(row) for row in refunds], [("A-101", 3900)])
+
+    def test_demo_respects_database_filename_case_before_first_open(self):
+        self.directory.mkdir()
+        probe = self.directory / "case-probe"
+        probe.touch()
+        ignores_case = probe.with_name("CASE-PROBE").exists()
+        probe.unlink()
+
+        output = ".support-actions/STATE.SQLITE3"
+        if ignores_case:
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                self.cli("demo", "--out", output)
+            self.assertEqual(failure.exception.returncode, 1)
+            self.assertEqual(failure.exception.stderr.strip(), "演示输出不能覆盖业务数据库")
+            self.assertEqual(list(self.directory.iterdir()), [])
+        else:
+            self.cli("demo", "--out", output)
+
+        self.assertFalse((self.directory / "state.sqlite3").exists())
+        with self.runner() as runner:
+            self.assertEqual(runner.backend.order("A-101")["order_id"], "A-101")
 
     def test_demo_preserves_previous_export_when_disk_fills(self):
         out = self.directory / "demo.json"
