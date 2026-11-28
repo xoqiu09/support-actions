@@ -4,6 +4,7 @@ import math
 from typing import Callable
 
 from .backend import Backend
+from .trace import INVALID_VALUE
 
 
 class Rejected(Exception):
@@ -16,7 +17,8 @@ def money_cents(value) -> int:
     amount = Decimal(str(value))
     if amount <= 0 or amount.as_tuple().exponent < -2:
         raise Rejected("退款金额须为大于零且最多两位小数的金额")
-    return int(amount * 100)
+    numerator, denominator = amount.as_integer_ratio()
+    return numerator * 100 // denominator
 
 
 def lookup_order(backend: Backend, order_id: str) -> dict:
@@ -63,6 +65,8 @@ def validate(backend: Backend, account: str, name: str, params: dict) -> None:
             raise Rejected("无权查看其他账户的订单")
         return
 
+    if name == "lookup_order" and params["order_id"] == INVALID_VALUE:
+        raise Rejected("订单号格式错误")
     order = backend.order(params["order_id"])
     if order is None:
         raise Rejected("订单不存在")
