@@ -79,6 +79,14 @@ class Backend:
         self.db.execute("UPDATE orders SET address = ? WHERE order_id = ?", (safe_address(new_address), order_id))
         return {"order_id": order_id, "address_changed": True}
 
+    def remaining_refund_cents(self, order_id: str) -> int:
+        return self.db.execute("""
+            SELECT paid_cents - (
+                SELECT COALESCE(SUM(amount_cents), 0) FROM refunds WHERE refunds.order_id = orders.order_id
+            )
+            FROM orders WHERE order_id = ?
+        """, (order_id,)).fetchone()[0]
+
     def refund(self, order_id: str, amount_cents: int) -> dict:
         inserted = self.db.execute("""
             INSERT INTO refunds (order_id, amount_cents)

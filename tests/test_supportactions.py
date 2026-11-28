@@ -8,6 +8,7 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from decimal import localcontext
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -74,6 +75,24 @@ class SupportActionsTests(unittest.TestCase):
             self.assertEqual(runner.backend.order("A-101")["address"], "青柚南路***")
             orders = run["steps"][2]["result"]["orders"]
             self.assertEqual([row["order_id"] for row in orders], ["A-101", "A-102", "A-103"])
+
+    def test_lookup_rejects_malformed_order_id(self):
+        with self.runner() as runner:
+            for order_id in ("A-101X", "A-101Ｘ", "AA-101"):
+                with self.subTest(order_id=order_id):
+                    step = runner.submit("A", plan(f"查订单 {order_id}", "A"))["steps"][0]
+                    self.assertEqual(
+                        (step["status"], step["result"], step["error"]),
+                        (REJECTED, None, "订单号格式错误"),
+                    )
+
+    def test_lookup_accepts_complete_order_id(self):
+        with self.runner() as runner:
+            for message in ("查订单 A-101", "查订单A-101？"):
+                with self.subTest(message=message):
+                    step = runner.submit("A", plan(message, "A"))["steps"][0]
+                    self.assertEqual(step["status"], trace.SUCCESS)
+                    self.assertEqual(step["result"]["order_id"], "A-101")
 
     def test_invalid_arguments_block_only_that_step_and_its_dependents(self):
         calls = [
@@ -195,6 +214,20 @@ class SupportActionsTests(unittest.TestCase):
         with self.runner() as runner:
             self.assertEqual(runner.backend.refund_count("A-102"), 1)
 
+    def test_refund_after_full_refund_is_rejected_before_approval(self):
+        with self.runner() as runner:
+            first = runner.submit("A", plan(REFUND, "A"))["run_id"]
+            self.assertEqual(runner.decide(first, 1, APPROVED)["status"], trace.SUCCESS)
+            queue_before = runner.queue()
+
+            second = runner.submit("A", plan("A-102 退款 1 元", "A"))
+            queue_after = runner.queue()
+            self.assertEqual(
+                (second["status"], second["steps"][0]["error"], len(queue_after) - len(queue_before)),
+                (REJECTED, "退款金额超过剩余可退金额", 0),
+            )
+            self.assertEqual(queue_after, queue_before)
+
     def test_approved_refunds_cannot_exceed_remaining_amount(self):
         with self.runner() as runner:
             first = runner.submit("A", plan(REFUND, "A"))["run_id"]
@@ -227,6 +260,21 @@ class SupportActionsTests(unittest.TestCase):
             self.assertEqual([tuple(row) for row in rows], [("A-102", 7713), ("A-102", 12187)])
             keys = restarted.db.execute("SELECT effect_key FROM effects ORDER BY effect_key")
             self.assertEqual([row[0] for row in keys], [f"{run_id}:1", f"{run_id}:2"])
+
+    def test_refund_amount_is_exact_with_low_decimal_precision(self):
+        with self.runner() as runner:
+            pending = runner.submit("A", plan("A-102 退款 128.99 元", "A"))
+            self.assertEqual(pending["status"], PENDING)
+            with localcontext() as ctx:
+                ctx.prec = 4
+                approved = runner.decide(pending["run_id"], 1, APPROVED)
+
+            self.assertEqual(approved["status"], trace.SUCCESS)
+            rows = runner.db.execute("SELECT amount_cents FROM refunds WHERE order_id = ?", ("A-102",))
+            self.assertEqual(
+                (approved["steps"][0]["result"]["refunded_cents"], [row[0] for row in rows]),
+                (12899, [12899]),
+            )
 
     def test_backend_retries_same_effect_key_once_even_after_restart(self):
         with self.runner() as runner:

@@ -35,7 +35,8 @@ def plan(message: str, account: str) -> list[Call]:
     if message == "坏计划":
         return [Call("list_orders", {"account": account}), Call("delete_order", {})]
 
-    orders = re.findall(r"[A-Z]-[0-9]+", message)
+    lookup_text = message.replace("查订单", " ")
+    orders = re.findall(r"(?<![\w-])[\w-]*[A-Z]-[0-9][\w-]*", lookup_text)
     params = {"order_id": orders[0]} if orders else {}
     if "退款" in message:
         refund = re.fullmatch(

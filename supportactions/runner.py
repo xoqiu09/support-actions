@@ -223,6 +223,10 @@ class Runner:
         if tool.risk == "high":
             previous = events.get(step)
             if previous is None:
+                amount_cents = money_cents(call.params["amount"])
+                remaining_cents = self.backend.remaining_refund_cents(call.params["order_id"])
+                if amount_cents > remaining_cents:
+                    return record(REJECTED, error="退款金额超过剩余可退金额")
                 required = self._required_approvals(call.params["amount"])
                 self.approvals.enqueue(run_id, step, self.clock(), required)
                 return record(PENDING)
