@@ -1,5 +1,6 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import json
 import sqlite3
 
 
@@ -41,7 +42,35 @@ class Approvals:
             self.db.executemany("UPDATE approval_votes SET approver = ? WHERE rowid = ?",
                                 ((_approver_digest(row["approver"]), row["rowid"]) for row in rows))
 
+    def upgrade_deadlines(self) -> None:
+        rows = self.db.execute("""
+            SELECT approvals.run_id, approvals.step, approvals.deadline, events.payload
+            FROM approvals JOIN events ON events.seq = (
+                SELECT MIN(first.seq) FROM events AS first
+                WHERE first.run_id = approvals.run_id AND first.step = approvals.step
+            )
+            WHERE approvals.status = ?
+        """, (PENDING,)).fetchall()
+        for row in rows:
+            event = json.loads(row["payload"])
+            if event["status"] != PENDING:
+                continue
+            enqueued_at = datetime.fromisoformat(event["time"])
+            deadline = datetime.fromisoformat(row["deadline"])
+            if enqueued_at.utcoffset() is None or deadline.utcoffset() is None:
+                continue
+
+            # Old deadlines use local wall time. Recover the enqueue offset from the first event.
+            # Keep the stored instant if it is closer to the audited deadline, including UTC writes.
+            expected = enqueued_at.astimezone(timezone.utc) + TTL
+            corrected = deadline.replace(tzinfo=enqueued_at.tzinfo).astimezone(timezone.utc)
+            if abs(corrected - expected) < abs(deadline - expected):
+                self.db.execute("UPDATE approvals SET deadline = ? WHERE run_id = ? AND step = ?",
+                                (corrected.isoformat(), row["run_id"], row["step"]))
+
     def enqueue(self, run_id: str, step: int, now: datetime, required: int) -> None:
+        if now.utcoffset() is not None:
+            now = now.astimezone(timezone.utc)
         self.db.execute(
             "INSERT INTO approvals VALUES (?, ?, ?, ?, ?)",
             (run_id, step, PENDING, (now + TTL).isoformat(), required),

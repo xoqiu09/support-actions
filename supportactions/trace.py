@@ -3,7 +3,10 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import closing
+from hashlib import sha256
+from itertools import chain
 from tempfile import NamedTemporaryFile
 
 
@@ -96,6 +99,44 @@ def _event_payloads(db: sqlite3.Connection, run_id: str) -> list[str]:
     )]
 
 
+def _trace_path(traces: Path, run_id: str) -> Path:
+    if run_id == run_id.lower():
+        return traces / f"{run_id}.jsonl"
+    digest = sha256(run_id.encode("ascii")).hexdigest()
+    return traces / "case-sensitive" / f"{digest}.jsonl"
+
+
+def _write_trace(path: Path, lines: Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.writelines(lines)
+            handle.flush()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _preserve_legacy_trace(path: Path, run_id: str) -> None:
+    try:
+        existing = path.open(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    with existing:
+        try:
+            first_line = existing.readline()
+            event = json.loads(first_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        legacy_id = event.get("run_id") if isinstance(event, dict) else None
+        if (isinstance(legacy_id, str) and legacy_id.isascii()
+                and legacy_id != run_id and legacy_id.lower() == run_id):
+            legacy_path = _trace_path(path.parent, legacy_id)
+            if not legacy_path.exists():
+                _write_trace(legacy_path, chain((first_line,), existing))
+
+
 def publish(directory: Path, db: sqlite3.Connection, run_id: str) -> Path:
     validate_run_id(run_id)
     # Serialize projection with writers so a concurrent process cannot overwrite a newer trace.
@@ -104,16 +145,10 @@ def publish(directory: Path, db: sqlite3.Connection, run_id: str) -> Path:
         payloads = _event_payloads(db, run_id)
         if not payloads:
             raise ValueError("运行号不存在")
-        path = directory / "traces" / f"{run_id}.jsonl"
-        path.parent.mkdir(exist_ok=True)
-        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-            temporary = Path(handle.name)
-            try:
-                handle.writelines(payload + "\n" for payload in payloads)
-                handle.flush()
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+        path = _trace_path(directory / "traces", run_id)
+        if run_id == run_id.lower():
+            _preserve_legacy_trace(path, run_id)
+        _write_trace(path, (payload + "\n" for payload in payloads))
     return path
 
 

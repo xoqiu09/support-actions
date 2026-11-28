@@ -9,10 +9,11 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import ANY, DEFAULT, Mock, call, patch
+from zoneinfo import ZoneInfo
 
 from supportactions import trace
 from supportactions import __main__ as cli_module
-from supportactions.approvals import APPROVED, EXPIRED, PENDING, REJECTED
+from supportactions.approvals import APPROVED, EXPIRED, PENDING, REJECTED, TTL, Approvals
 from supportactions.backend import Backend
 from supportactions.planner import Call, plan
 from supportactions.runner import Runner
@@ -136,6 +137,20 @@ class SupportActionsTests(unittest.TestCase):
 
             same_order = runner.submit("A", plan("查订单 A-102，给 A-102 退款 39 元", "A"))
             self.assertEqual(same_order["steps"][0]["status"], PENDING)
+
+    def test_negated_refund_does_not_enter_approval_queue(self):
+        with self.runner() as runner:
+            runner.submit("A", plan("A-102 不要退款 39 元", "A"))
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
+            self.assertEqual(len(runner.queue()), 0)
+
+    def test_affirmative_refund_enters_approval_queue(self):
+        with self.runner() as runner:
+            run = runner.submit("A", plan("A-102 退款 39 元", "A"))
+            self.assertEqual([(row["run_id"], row["status"]) for row in runner.queue()], [
+                (run["run_id"], PENDING),
+            ])
+            self.assertEqual(runner.backend.refund_count("A-102"), 0)
 
     def test_refund_waits_for_approval_and_runs_once_after_restart(self):
         pending = self.cli("ask", "--account", "A", REFUND)
@@ -274,6 +289,44 @@ class SupportActionsTests(unittest.TestCase):
             self.assertEqual(trace.replay(self.directory, expired_on_queue)["status"], EXPIRED)
             self.assertEqual(runner.backend.refund_count("A-102"), 0)
 
+    def test_refund_approval_expires_after_five_minutes_across_clock_rollback(self):
+        local_zone = ZoneInfo("America/Los_Angeles")
+        start = datetime(2026, 11, 1, 8, 58, tzinfo=timezone.utc)
+        deadline = start + timedelta(minutes=5)
+        self.now = start.astimezone(local_zone)
+        with self.runner() as runner:
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            self.now = (deadline - timedelta(seconds=1)).astimezone(local_zone)
+            self.assertEqual(runner.queue()[0]["status"], PENDING)
+
+            self.now = deadline.astimezone(local_zone)
+            result = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual((result["status"], runner.backend.refund_count("A-102")), (EXPIRED, 0))
+
+    def test_legacy_refund_approval_expires_after_clock_rollback_and_reopen(self):
+        def enqueue_with_local_deadline(approvals, run_id, step, now, required):
+            approvals.db.execute("INSERT INTO approvals VALUES (?, ?, ?, ?, ?)",
+                                 (run_id, step, PENDING, (now + TTL).isoformat(), required))
+
+        local_zone = ZoneInfo("America/Los_Angeles")
+        start = datetime(2026, 11, 1, 8, 58, tzinfo=timezone.utc)
+        self.now = start.astimezone(local_zone)
+        with self.runner() as runner, patch.object(Approvals, "enqueue", enqueue_with_local_deadline):
+            run_id = runner.submit("A", plan("A-102 退款 39 元", "A"))["run_id"]
+            runner.db.execute("PRAGMA user_version = 1")
+
+        deadline = start + timedelta(minutes=5)
+        self.now = (deadline - timedelta(seconds=1)).astimezone(local_zone)
+        with self.runner() as runner:
+            queued = runner.queue()[0]
+            self.assertEqual(queued["status"], PENDING)
+
+        self.now = deadline.astimezone(local_zone)
+        with self.runner() as runner:
+            result = runner.decide(run_id, 1, APPROVED)
+            self.assertEqual((result["status"], runner.backend.refund_count("A-102")), (EXPIRED, 0))
+            self.assertEqual(datetime.fromisoformat(queued["deadline"]), deadline)
+
     def test_rejected_approval_stops_remaining_independent_steps(self):
         calls = [
             *plan(REFUND, "A"),
@@ -399,6 +452,61 @@ class SupportActionsTests(unittest.TestCase):
         self.assertEqual(output[0], "运行号 test-replay")
         self.assertEqual([json.loads(line) for line in output[1:-1]], original)
         self.assertEqual(output[-1], "最终状态 成功")
+
+    def test_trace_files_keep_run_ids_that_differ_only_by_case(self):
+        replace, read_text = Path.replace, Path.read_text
+        destinations = []
+        files_by_folded_path = {}
+
+        def replace_ignoring_case(source, destination):
+            destinations.append(destination)
+            actual_path = files_by_folded_path.setdefault(str(destination).casefold(), destination)
+            return replace(source, actual_path)
+
+        def read_ignoring_case(path, *args, **kwargs):
+            actual_path = files_by_folded_path.get(str(path).casefold(), path)
+            return read_text(actual_path, *args, **kwargs)
+
+        with (
+            self.runner() as runner,
+            patch.object(Path, "replace", replace_ignoring_case),
+            patch.object(Path, "read_text", read_ignoring_case),
+        ):
+            runner.submit("A", plan("查订单 A-101", "A"), run_id="CaseA")
+            runner.submit("A", plan("查订单 A-102", "A"), run_id="casea")
+            events = [json.loads(path.read_text(encoding="utf-8")) for path in destinations]
+
+        self.assertEqual([event["result"]["order_id"] for event in events], ["A-101", "A-102"])
+        self.assertEqual(destinations[1], self.directory / "traces" / "casea.jsonl")
+
+    def test_new_lowercase_trace_preserves_legacy_mixed_case_trace(self):
+        traces = self.directory / "traces"
+        legacy_path = traces / "CaseA.jsonl"
+        lowercase_path = traces / "casea.jsonl"
+        open_path, replace = Path.open, Path.replace
+
+        def open_ignoring_case(path, *args, **kwargs):
+            return open_path(legacy_path if path == lowercase_path else path, *args, **kwargs)
+
+        def replace_ignoring_case(source, destination):
+            return replace(source, legacy_path if destination == lowercase_path else destination)
+
+        with self.runner() as runner:
+            original = runner.submit("A", plan("查订单 A-101", "A"), run_id="CaseA")
+            # Recreate the filename written by the old version using the original audit contents.
+            next((traces / "case-sensitive").glob("*.jsonl")).replace(legacy_path)
+
+        with (
+            self.runner() as runner,
+            patch.object(Path, "open", open_ignoring_case),
+            patch.object(Path, "replace", replace_ignoring_case),
+        ):
+            runner.submit("A", plan("查订单 A-102", "A"), run_id="casea")
+            copied_paths = sorted((traces / "case-sensitive").glob("*.jsonl"))
+            events = [json.loads(path.read_text(encoding="utf-8")) for path in [*copied_paths, lowercase_path]]
+
+        self.assertEqual([event["result"]["order_id"] for event in events], ["A-101", "A-102"])
+        self.assertEqual(events[0], original["events"][0])
 
     def test_addresses_are_redacted_in_every_persisted_record(self):
         with self.runner() as runner:

@@ -38,12 +38,15 @@ def plan(message: str, account: str) -> list[Call]:
     orders = re.findall(r"[A-Z]-[0-9]+", message)
     params = {"order_id": orders[0]} if orders else {}
     if "退款" in message:
-        if len(set(orders)) > 1:
-            del params["order_id"]
-        amount = re.search(r"退款\s*(-?[0-9]+(?:\.[0-9]{1,2})?)\s*元", message)
-        if amount:
-            params["amount"] = float(amount.group(1))
-        return [Call("refund", params)]
+        refund = re.fullmatch(
+            r"\s*(?:我的订单\s*|查订单\s*(?P<lookup>[A-Z]-[0-9]+)\s*[，,]\s*给\s*)?"
+            r"(?P<order_id>[A-Z]-[0-9]+)\s*退款\s*(?P<amount>-?[0-9]+(?:\.[0-9]{1,2})?)\s*元\s*",
+            message,
+        )
+        if refund is None or refund["lookup"] not in (None, refund["order_id"]):
+            # Reject the invalid refund step without blocking independent steps.
+            return [Call("refund", {})]
+        return [Call("refund", {"order_id": refund["order_id"], "amount": float(refund["amount"])})]
     if "改地址" in message:
         address_change = re.fullmatch(r"\s*([A-Z]-[0-9]+)\s*改地址(?:\s+(\S.*?))?\s*", message)
         if address_change is None:

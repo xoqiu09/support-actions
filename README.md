@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-实跑 `/opt/homebrew/bin/python3 -m unittest`，**38 项全部通过**。测试确认越权操作和引用可疑备注的步骤会被拒绝，未经批准的退款不会入账，同一退款步骤在重复批准、超时或重启后也不会重复入账，回放不会再次调用业务系统。
+实跑 `/opt/homebrew/bin/python3 -m unittest`，**44 项全部通过**。测试确认越权操作和引用可疑备注的步骤会被拒绝，未经批准的退款不会入账，同一退款步骤在重复批准、超时或重启后也不会重复入账，回放不会再次调用业务系统。
 
 在临时副本里逐项破坏订单权限、退款审批、防重复退款、可疑备注标记、账户限额和大额双人审批，对应测试均按预期失败。恢复代码后，全套测试再次通过。
 
@@ -30,7 +30,7 @@ python3 -m supportactions ask --account A "A-102 退款 39 元"
 - A support team needs to handle order requests without exposing another customer’s orders or issuing duplicate refunds.
 - The demo looks up orders, updates shipping addresses before dispatch, and puts refunds in an approval queue.
 - Large refunds require approval under two distinct approver IDs. The audit trail can be replayed without calling the simulated backend.
-- All 38 tests passed. Deliberately breaking key rules made the corresponding tests fail.
+- All 44 tests passed. Deliberately breaking key rules made the corresponding tests fail.
 - The demo uses fictional data, has no live model or users, and was built with AI coding tools under the owner’s requirements and acceptance criteria.
 
 ## 运行

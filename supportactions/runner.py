@@ -45,10 +45,13 @@ class Runner:
                     account TEXT, window TEXT, used INTEGER, PRIMARY KEY (account, window)
                 )
             """)
-            if self.db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 0:
                 self._restore_quota_usage()
                 self.approvals.upgrade_votes()
-                self.db.execute("PRAGMA user_version = 1")
+            if version < 2:
+                self.approvals.upgrade_deadlines()
+                self.db.execute("PRAGMA user_version = 2")
 
     def _restore_quota_usage(self) -> None:
         current_minute, current_day = _quota_windows(self.clock())
