@@ -30,9 +30,11 @@ def safe_tool(name: str) -> str:
 
 
 def safe_address(value: str) -> str:
-    street = re.match(r"[\u4e00-\u9fff]{1,32}?(?:路|街|道|巷|弄)", value)
-    prefix = street.group() if street else ""
-    if re.search(r"[〇零一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟两]", prefix):
+    subdistrict = re.match(r"[\u4e00-\u9fff]{1,32}?街道", value)
+    start = subdistrict.end() if subdistrict else 0
+    street = re.match(r"[\u4e00-\u9fff]{1,32}?(?:路|街(?!道)|(?<!街)道|巷|弄)", value[start:])
+    prefix = value[:start + street.end()] if street else ""
+    if len(prefix) > 33 or re.search(r"[〇零一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟两]", prefix):
         prefix = ""
     return prefix + "***"
 

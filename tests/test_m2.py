@@ -223,6 +223,12 @@ class M2Tests(unittest.TestCase):
         self.assertFalse(identifier.encode() in (self.directory / "state.sqlite3").read_bytes(),
                          "旧审批票仍保存审批人原文")
 
+    def test_invalid_refund_cap_is_rejected_before_creating_database(self):
+        with self.assertRaisesRegex(ValueError, "退款门槛无效"):
+            with self.runner(refund_cap_cents=float("nan")):
+                pass
+        self.assertFalse((self.directory / "state.sqlite3").exists())
+
     def test_exact_cap_uses_one_approval_and_configured_cap_is_used(self):
         with self.runner() as runner:
             exact = self.ask(runner, "A", "A-103 退款 500 元")
