@@ -183,6 +183,7 @@ def main() -> None:
                     decision = APPROVED if args.command == "approve" else REJECTED
                     print_run(runner.decide(
                         args.run_id, args.step, decision, approver=getattr(args, "approver", "default"),
+                        fail_on_conflict=True,
                     ))
     except ValueError as exc:
         parser.exit(1, f"{exc}\n")

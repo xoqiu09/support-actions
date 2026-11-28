@@ -37,7 +37,7 @@ def plan(message: str, account: str) -> list[Call]:
 
     lookup_text = message.replace("查订单", " ")
     orders = re.findall(r"(?<![\w-])[\w-]*[A-Z]-[0-9][\w-]*", lookup_text)
-    params = {"order_id": orders[0]} if orders else {}
+    params = {"order_id": orders[0].removesuffix("发货了吗")} if orders else {}
     if "退款" in message:
         refund = re.fullmatch(
             r"\s*(?:我的订单\s*|查订单\s*(?P<lookup>[A-Z]-[0-9]+)\s*[，,]\s*给\s*)?"

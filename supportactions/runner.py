@@ -133,7 +133,8 @@ class Runner:
             self._advance(run_id)
         return trace.replay(self.directory, run_id)
 
-    def decide(self, run_id: str, step: int, decision: str, *, approver: str = "default") -> dict:
+    def decide(self, run_id: str, step: int, decision: str, *, approver: str = "default",
+               fail_on_conflict: bool = False) -> dict:
         if decision not in (APPROVED, REJECTED):
             raise ValueError("审批决定只能是“已批准”或“已拒绝”")
         approver = approver.strip().casefold()
@@ -141,7 +142,10 @@ class Runner:
             raise ValueError("审批人不能为空")
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            self.approvals.decide(run_id, step, self.clock(), decision, approver=approver)
+            status = self.approvals.decide(run_id, step, self.clock(), decision, approver=approver)
+            if fail_on_conflict and status in (APPROVED, REJECTED) and status != decision:
+                action = "批准" if decision == APPROVED else "拒绝"
+                raise ValueError(f"该退款{status}，本次{action}未生效")
             self._advance(run_id)
         return trace.replay(self.directory, run_id)
 
